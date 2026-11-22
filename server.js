@@ -17,20 +17,15 @@ setInterval(() => {
 }, 30000);
 
 // ---------------- chat ----------------
-// One shared room for everyone using Chrome Client. Players prove who they are with Mojang's own login check (the same one
-// Minecraft servers use), so nobody can type as somebody else: /chat/nonce -> the game calls joinServer with it -> /chat/login.
-const CHAT_FILE = process.env.CHAT_FILE || "chat.json";
+// Players prove who they are with Mojang's own login check (the same one Minecraft servers use), so nobody can type as
+// somebody else: /chat/nonce -> the game calls joinServer with it -> /chat/login. (There is no public room: only friends can talk.)
 const MOJANG = (process.env.MOJANG_URL || "https://sessionserver.mojang.com").replace(/\/$/, "");
 const BANNED = new Set((process.env.CHAT_BANNED || "").toLowerCase().split(",").map((s) => s.trim()).filter(Boolean));   // uuids, no dashes
-const KEEP = 300;            // messages kept
 const MAX_LEN = 200;         // characters in a message
 const MIN_GAP = 1200;        // ms between two messages from one player
 const PER_MIN = 20;          // messages per minute per player
 const NONCE_TTL = 60 * 1000, SESSION_TTL = 12 * 3600 * 1000;
 
-let chat = { last: 0, msgs: [] };
-try { const c = JSON.parse(fs.readFileSync(CHAT_FILE, "utf8")); if (c && Array.isArray(c.msgs)) chat = { last: Number(c.last) || 0, msgs: c.msgs.slice(-KEEP) }; } catch {}
-let chatDirty = false;
 const nonces = new Map();     // nonce -> expires
 const sessions = new Map();   // token -> { u, n, exp, lastAt, times: [] }
 const ipHits = new Map();     // ip -> [timestamps]
@@ -40,7 +35,6 @@ setInterval(() => {
   for (const [k, v] of nonces) if (v < now) nonces.delete(k);
   for (const [k, v] of sessions) if (v.exp < now) sessions.delete(k);
   for (const [k, v] of ipHits) { const keep = v.filter((t) => now - t < 60000); if (keep.length) ipHits.set(k, keep); else ipHits.delete(k); }
-  if (chatDirty) { try { fs.writeFileSync(CHAT_FILE, JSON.stringify(chat)); chatDirty = false; } catch {} }
 }, 15000);
 
 function tooManyFromIp(req, limit) {
@@ -103,24 +97,6 @@ async function chatRoute(req, url, send) {
   if (BANNED.has(s.u)) return send({ error: "you are not allowed to chat" }, 403);
   lastSeen.set(s.u, Date.now());
   if (p.startsWith("/social/")) return socialRoute(req, url, send, s);
-  if (p === "/chat/get" && req.method === "GET") {
-    const after = Number(url.searchParams.get("after")) || 0;
-    const out = chat.msgs.filter((m) => m.id > after).slice(-100);
-    return send({ messages: out, last: chat.last });
-  }
-  if (p === "/chat/send" && req.method === "POST") {
-    let b; try { b = await readJson(req); } catch (e) { return send({ error: e.message }, 400); }
-    const text = cleanText(b.text);
-    if (!text) return send({ error: "empty message" }, 400);
-    const now = Date.now();
-    s.times = s.times.filter((t) => now - t < 60000);
-    if (now - s.lastAt < MIN_GAP || s.times.length >= PER_MIN) return send({ error: "too fast" }, 429);
-    s.lastAt = now; s.times.push(now);
-    const m = { id: ++chat.last, t: now, u: dash(s.u), n: s.n, m: text };
-    chat.msgs.push(m); if (chat.msgs.length > KEEP) chat.msgs.splice(0, chat.msgs.length - KEEP);
-    chatDirty = true;
-    return send({ ok: true, id: m.id });
-  }
   return send({ error: "not found" }, 404);
 }
 
