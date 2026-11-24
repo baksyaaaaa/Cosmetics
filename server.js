@@ -137,7 +137,9 @@ async function chatRoute(req, url, send) {
     if (!/^[0-9a-f]{32}$/.test(u)) return send({ error: "bad answer from Mojang" }, 502);
     if (BANNED.has(u) || BANNED.has(dash(u))) return send({ error: "you are not allowed to chat" }, 403);
     const token = crypto.randomBytes(24).toString("hex");
-    sessions.set(token, { u, n: cleanName(prof.name) || name, exp: Date.now() + SESSION_TTL, lastAt: 0, times: [] });
+    const sess = { u, n: cleanName(prof.name) || name, exp: Date.now() + SESSION_TTL, lastAt: 0, times: [] };
+    sess.team = isTeam(sess);
+    sessions.set(token, sess);
     if (soc.names[u] !== (cleanName(prof.name) || name)) { soc.names[u] = cleanName(prof.name) || name; socDirty = true; }
     return send({ token, uuid: dash(u), name: cleanName(prof.name) || name, expiresIn: SESSION_TTL / 1000 });
   }
@@ -153,12 +155,36 @@ async function chatRoute(req, url, send) {
 // Same sign-in as the chat room. Friends need both sides to agree (request -> accept). Only friends can message each other.
 const SOCIAL_FILE = process.env.SOCIAL_FILE || "social.json";
 const MAX_FRIENDS = 100, MAX_PENDING = 30, DM_KEEP = 200;
-let soc = { names: {}, friends: {}, req: [], dms: {}, read: {} };   // names: uuid -> name, friends: uuid -> [uuid], req: [{f,t}], dms: pair -> {last,msgs}, read: "uuid|pair" -> id
-try { const c = JSON.parse(fs.readFileSync(SOCIAL_FILE, "utf8")); if (c && c.names) soc = { names: c.names, friends: c.friends || {}, req: c.req || [], dms: c.dms || {}, read: c.read || {} }; } catch {}
+
+// ---------------- the SC Client team chat ----------------
+// Every player has an "SC Client" chat at the top of their friends list: it opens with the welcome below, and a player can
+// send one message there every 14 days. The team (TEAM_NAMES) sees each player who wrote as their own chat and can answer freely.
+const TEAM_ID = "5c000000000000000000000000000001";
+const TEAM_CHAT_NAME = "SC Client";
+const TEAM_NAMES = (process.env.TEAM_NAMES || "baksya,wsammyyy").split(",").map((x) => x.trim()).filter(Boolean);
+const TEAM_GAP = 14 * 24 * 3600 * 1000;
+const WELCOME_FROM = "baksya & wsammyyy";
+const WELCOME = "We're baksya and wsammyyy, the creators of SC Client. If you have any questions, feel free to ask them in this chat. " +
+  "Think carefully about what you send, though: you can only send one message here every 14 days.";
+const teamFaces = new Map();   // lower-case name -> uuid (no dashes), looked up from Mojang
+async function lookUpTeamFaces() {
+  for (const name of TEAM_NAMES) {
+    try {
+      const r = await fetch(`https://api.mojang.com/users/profiles/minecraft/${encodeURIComponent(name)}`, { signal: AbortSignal.timeout(8000) });
+      if (r.ok) { const j = await r.json(); if (/^[0-9a-f]{32}$/i.test(j.id || "")) teamFaces.set(name.toLowerCase(), j.id.toLowerCase()); }
+    } catch {}
+  }
+}
+lookUpTeamFaces(); setInterval(lookUpTeamFaces, 6 * 3600 * 1000);
+const isTeam = (s) => TEAM_NAMES.some((n) => n.toLowerCase() === String(s.n || "").toLowerCase()) || [...teamFaces.values()].includes(s.u);
+const faces = () => TEAM_NAMES.map((n) => teamFaces.get(n.toLowerCase())).filter(Boolean).map(dash);
+let soc = { names: {}, friends: {}, req: [], dms: {}, read: {}, team: { threads: {}, sent: {}, ids: {} } };   // names: uuid -> name, friends: uuid -> [uuid], req: [{f,t}], dms: pair -> {last,msgs}, read: "uuid|pair" -> id, team: the SC Client chat
+const teamOf = (c) => ({ threads: (c.team && c.team.threads) || {}, sent: (c.team && c.team.sent) || {}, ids: (c.team && c.team.ids) || {} });
+try { const c = JSON.parse(fs.readFileSync(SOCIAL_FILE, "utf8")); if (c && c.names) soc = { names: c.names, friends: c.friends || {}, req: c.req || [], dms: c.dms || {}, read: c.read || {}, team: teamOf(c) }; } catch {}
 let socDirty = false;
 const lastSeen = new Map();   // uuid -> ms of the last call, for the green dot
 setInterval(() => { if (socDirty) { try { fs.writeFileSync(SOCIAL_FILE, JSON.stringify(soc)); socDirty = false; } catch {} } }, 15000);
-const useSocial = (c) => { if (c && c.names) soc = { names: c.names, friends: c.friends || {}, req: c.req || [], dms: c.dms || {}, read: c.read || {} }; };
+const useSocial = (c) => { if (c && c.names) soc = { names: c.names, friends: c.friends || {}, req: c.req || [], dms: c.dms || {}, read: c.read || {}, team: teamOf(c) }; };
 
 // save to GitHub about once a minute, and once more when the host stops the server
 let saving = false;
@@ -198,6 +224,34 @@ function befriend(a, b) {
   if (!areFriends(b, a)) friendsOf(b).push(a);
 }
 
+// the team's view: each player's chat with the team gets its own id ("5c" + 30 hex), kept in soc.team.ids
+function supportId(u) {
+  const id = "5c" + crypto.createHash("sha256").update("team|" + u).digest("hex").slice(0, 30);
+  if (soc.team.ids[id] !== u) { soc.team.ids[id] = u; socDirty = true; }
+  return id;
+}
+const teamThread = (u) => soc.team.threads[u] || (soc.team.threads[u] = { last: 1, msgs: [] });   // id 1 is the welcome
+function teamView(u, viewer, teamSide) {
+  const t = soc.team.threads[u] || { last: 1, msgs: [] };
+  const all = [{ id: 1, t: 0, f: "team", m: WELCOME }, ...t.msgs];
+  return all.map((m) => ({
+    id: m.id, t: m.t, m: m.m,
+    n: m.f === "team" ? WELCOME_FROM : m.f === u ? nameOf(u) : nameOf(m.f),
+    mine: teamSide ? m.f !== u : m.f === viewer,
+  }));
+}
+function teamUnread(u, teamSide) {
+  const t = soc.team.threads[u] || { last: 1, msgs: [] };
+  const key = teamSide ? "team-staff|" + u : u + "|team";
+  const seen = soc.read[key] || 0;
+  return [{ id: 1, f: "team" }, ...t.msgs].filter((m) => m.id > seen && (teamSide ? m.f === u : m.f !== u)).length;
+}
+function markTeamRead(u, teamSide) {
+  const t = soc.team.threads[u] || { last: 1 };
+  const key = teamSide ? "team-staff|" + u : u + "|team";
+  if ((soc.read[key] || 0) < t.last) { soc.read[key] = t.last; socDirty = true; }
+}
+
 async function socialRoute(req, url, send, s) {
   const p = url.pathname, me = s.u;
   if (p === "/social/state" && req.method === "GET") {
@@ -207,8 +261,12 @@ async function socialRoute(req, url, send, s) {
       const seen = soc.read[me + "|" + key] || 0;
       return t.msgs.filter((m) => m.id > seen && m.f !== me).length;
     };
+    const team = s.team ? Object.keys(soc.team.threads).filter((u) => u !== me && soc.team.threads[u].msgs.some((m) => m.f === u))
+      .map((u) => ({ u: dash(supportId(u)), n: "Help: " + nameOf(u), online: online(u), unread: teamUnread(u, true), faces: [dash(u)] }))
+      .sort((a, b) => b.unread - a.unread || a.n.localeCompare(b.n)) : [];
     return send({
-      friends: friendsOf(me).map((f) => ({ u: dash(f), n: nameOf(f), online: online(f), unread: dmUnread(f) })).sort((a, b) => (b.online - a.online) || a.n.localeCompare(b.n)),
+      friends: [{ u: dash(TEAM_ID), n: TEAM_CHAT_NAME, online: true, unread: teamUnread(me, false), faces: faces(), team: true }, ...team,
+        ...friendsOf(me).map((f) => ({ u: dash(f), n: nameOf(f), online: online(f), unread: dmUnread(f) })).sort((a, b) => (b.online - a.online) || a.n.localeCompare(b.n))],
       incoming: soc.req.filter((r) => r.t === me).map((r) => ({ u: dash(r.f), n: nameOf(r.f) })),
       outgoing: soc.req.filter((r) => r.f === me).map((r) => ({ u: dash(r.t), n: nameOf(r.t) })),
     });
@@ -216,9 +274,15 @@ async function socialRoute(req, url, send, s) {
   if (req.method !== "POST" && p !== "/social/dm/get") return send({ error: "not found" }, 404);
   if (p === "/social/dm/get" && req.method === "GET") {
     const f = norm(url.searchParams.get("u"));
+    const after = Number(url.searchParams.get("after")) || 0;
+    if (f === TEAM_ID || (s.team && soc.team.ids[f])) {
+      const who = f === TEAM_ID ? me : soc.team.ids[f], staff = f !== TEAM_ID;
+      const msgs = teamView(who, me, staff).filter((m) => m.id > after).slice(-100);
+      markTeamRead(who, staff);
+      return send({ messages: msgs, last: (soc.team.threads[who] || { last: 1 }).last });
+    }
     if (!isId(f) || !areFriends(me, f)) return send({ error: "not friends" }, 403);
     const key = pairKey(me, f), t = soc.dms[key] || { last: 0, msgs: [] };
-    const after = Number(url.searchParams.get("after")) || 0;
     const out = t.msgs.filter((m) => m.id > after).slice(-100).map((m) => ({ id: m.id, t: m.t, n: m.f === me ? s.n : nameOf(m.f), m: m.m, mine: m.f === me }));
     if (t.last > (soc.read[me + "|" + key] || 0)) { soc.read[me + "|" + key] = t.last; socDirty = true; }
     return send({ messages: out, last: t.last });
@@ -240,6 +304,26 @@ async function socialRoute(req, url, send, s) {
   }
   const other = norm(b.u);
   if (!isId(other)) return send({ error: "bad player" }, 400);
+  if (other === TEAM_ID || (s.team && soc.team.ids[other])) {
+    if (p !== "/social/dm/send") return send({ error: "The SC Client chat can't be changed." }, 400);
+    const text = cleanText(b.text);
+    if (!text) return send({ error: "empty message" }, 400);
+    const staff = other !== TEAM_ID, who = staff ? soc.team.ids[other] : me;
+    if (!staff && !s.team) {
+      const wait = (soc.team.sent[me] || 0) + TEAM_GAP - Date.now();
+      if (wait > 0) {
+        const days = Math.ceil(wait / (24 * 3600 * 1000));
+        return send({ error: `You can send one message here every 14 days. Try again in ${days} day${days === 1 ? "" : "s"}.` }, 429);
+      }
+    }
+    if (!rateOk(s)) return send({ error: "too fast" }, 429);
+    const t = teamThread(who);
+    t.msgs.push({ id: ++t.last, t: Date.now(), f: me, m: text });
+    if (t.msgs.length > DM_KEEP) t.msgs.splice(0, t.msgs.length - DM_KEEP);
+    if (!staff && !s.team) soc.team.sent[me] = Date.now();
+    markTeamRead(who, staff);   // what you sent is read on your side
+    socDirty = true; return send({ ok: true, id: t.last });
+  }
   if (p === "/social/accept") {
     if (!soc.req.some((r) => r.f === other && r.t === me)) return send({ error: "No such request." }, 404);
     if (friendsOf(me).length >= MAX_FRIENDS) return send({ error: "Your friend list is full." }, 400);

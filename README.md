@@ -33,3 +33,9 @@ Render stops it. If GitHub can't be read at start it keeps trying and never over
 
 **2. Keep it awake:** `.github/workflows/keep-awake.yml` visits the service every 10 minutes (free in a public repo).
 One always-on service fits in Render's 750 free hours a month.
+
+## The SC Client team chat
+Every player has an **SC Client** chat at the top of their friends list (id `5c000000-0000-0000-0000-000000000001`). It opens with a
+welcome from the team, and a player can send **one message there every 14 days**. Team members (`TEAM_NAMES`, default
+`baksya,wsammyyy` - Minecraft usernames) see every player who wrote as a "Help: <name>" chat and can answer without a limit.
+Friend entries can carry `faces` (player UUIDs to show as heads) and `team: true`.
