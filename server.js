@@ -274,7 +274,7 @@ async function socialRoute(req, url, send, s) {
       return t.msgs.filter((m) => m.id > seen && m.f !== me).length;
     };
     return send({
-      friends: [{ u: dash(TEAM_ID), n: TEAM_CHAT_NAME, online: true, unread: teamUnread(me, !!s.team), faces: faces(), team: true },
+      friends: [{ u: dash(TEAM_ID), n: TEAM_CHAT_NAME, online: true, unread: teamUnread(me, !!s.team), faces: faces(), team: true, limited: !s.team },
         ...friendsOf(me).map((f) => ({ u: dash(f), n: nameOf(f), online: online(f), unread: dmUnread(f) })).sort((a, b) => (b.online - a.online) || a.n.localeCompare(b.n))],
       incoming: soc.req.filter((r) => r.t === me).map((r) => ({ u: dash(r.f), n: nameOf(r.f) })),
       outgoing: soc.req.filter((r) => r.f === me).map((r) => ({ u: dash(r.t), n: nameOf(r.t) })),
