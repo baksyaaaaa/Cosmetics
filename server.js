@@ -165,7 +165,7 @@ const TEAM_NAMES = (process.env.TEAM_NAMES || "baksya,wsammyyy").split(",").map(
 const TEAM_GAP = 14 * 24 * 3600 * 1000;
 const WELCOME_FROM = "baksya & wsammyyy";
 const WELCOME = "We're baksya and wsammyyy, the creators of SC Client. If you have any questions, feel free to ask them in this chat. " +
-  "Think carefully about what you send, though: you can only send one message here every 14 days.";
+  "Be careful what you send, because you can only send one message here every 14 days.";
 const teamFaces = new Map();   // lower-case name -> uuid (no dashes), looked up from Mojang
 async function lookUpTeamFaces() {
   for (const name of TEAM_NAMES) {
