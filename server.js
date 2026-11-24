@@ -158,7 +158,9 @@ const MAX_FRIENDS = 100, MAX_PENDING = 30, DM_KEEP = 200;
 
 // ---------------- the SC Client team chat ----------------
 // Every player has an "SC Client" chat at the top of their friends list: it opens with the welcome below, and a player can
-// send one message there every 14 days. The team (TEAM_NAMES) sees each player who wrote as their own chat and can answer freely.
+// send one message there every 14 days. Players only see the welcome, their own messages, team announcements and team replies
+// to them. The team (TEAM_NAMES) sees every message from every player in that same chat and writes freely:
+// a message starting with @name goes only to that player, anything else goes to everyone.
 const TEAM_ID = "5c000000000000000000000000000001";
 const TEAM_CHAT_NAME = "SC Client";
 const TEAM_NAMES = (process.env.TEAM_NAMES || "baksya,wsammyyy").split(",").map((x) => x.trim()).filter(Boolean);
@@ -178,8 +180,15 @@ async function lookUpTeamFaces() {
 lookUpTeamFaces(); setInterval(lookUpTeamFaces, 6 * 3600 * 1000);
 const isTeam = (s) => TEAM_NAMES.some((n) => n.toLowerCase() === String(s.n || "").toLowerCase()) || [...teamFaces.values()].includes(s.u);
 const faces = () => TEAM_NAMES.map((n) => teamFaces.get(n.toLowerCase())).filter(Boolean).map(dash);
-let soc = { names: {}, friends: {}, req: [], dms: {}, read: {}, team: { threads: {}, sent: {}, ids: {} } };   // names: uuid -> name, friends: uuid -> [uuid], req: [{f,t}], dms: pair -> {last,msgs}, read: "uuid|pair" -> id, team: the SC Client chat
-const teamOf = (c) => ({ threads: (c.team && c.team.threads) || {}, sent: (c.team && c.team.sent) || {}, ids: (c.team && c.team.ids) || {} });
+let soc = { names: {}, friends: {}, req: [], dms: {}, read: {}, team: { feed: [], seq: 1, sent: {} } };   // names: uuid -> name, friends: uuid -> [uuid], req: [{f,t}], dms: pair -> {last,msgs}, read: "uuid|pair" -> id, team: the SC Client chat
+function teamOf(c) {
+  const t = c.team || {};
+  const out = { feed: Array.isArray(t.feed) ? t.feed : [], seq: Number(t.seq) || 1, sent: t.sent || {} };
+  for (const [u, th] of Object.entries(t.threads || {}))   // older layout: one thread per player
+    for (const m of th.msgs || []) out.feed.push({ id: ++out.seq, t: m.t, f: m.f, to: m.f === u ? "team" : u, m: m.m });
+  out.feed.sort((a, b) => a.id - b.id);
+  return out;
+}
 try { const c = JSON.parse(fs.readFileSync(SOCIAL_FILE, "utf8")); if (c && c.names) soc = { names: c.names, friends: c.friends || {}, req: c.req || [], dms: c.dms || {}, read: c.read || {}, team: teamOf(c) }; } catch {}
 let socDirty = false;
 const lastSeen = new Map();   // uuid -> ms of the last call, for the green dot
@@ -224,33 +233,36 @@ function befriend(a, b) {
   if (!areFriends(b, a)) friendsOf(b).push(a);
 }
 
-// the team's view: each player's chat with the team gets its own id ("5c" + 30 hex), kept in soc.team.ids
-function supportId(u) {
-  const id = "5c" + crypto.createHash("sha256").update("team|" + u).digest("hex").slice(0, 30);
-  if (soc.team.ids[id] !== u) { soc.team.ids[id] = u; socDirty = true; }
-  return id;
+// chat filter for the SC Client chat: blocks slurs and swearing (also with spacing/symbols/leetspeak); add more with BLOCKED_WORDS
+const BLOCKED = ["nigger","nigga","faggot","fag","retard","tranny","kike","chink","spic","wetback","coon","dyke",
+  "fuck","shit","bitch","cunt","dick","cock","pussy","asshole","bastard","whore","slut","porn","nude","nudes","sex","rape",
+  "kys","killyourself"].concat((process.env.BLOCKED_WORDS || "").split(",").map((w) => w.trim().toLowerCase()).filter(Boolean));
+const LEET = { "0": "o", "1": "i", "!": "i", "|": "i", "3": "e", "4": "a", "@": "a", "5": "s", "$": "s", "7": "t", "8": "b", "9": "g" };
+function blocked(text) {
+  const low = text.toLowerCase().replace(/[0-9!|@$]/g, (c) => LEET[c] || c);
+  const parts = low.split(/[^a-z]+/).filter(Boolean), words = [];
+  for (const x of parts) {   // "f u c k" -> "fuck"
+    if (x.length === 1 && words.length && words[words.length - 1].single) words[words.length - 1].w += x;
+    else words.push({ w: x, single: x.length === 1 });
+  }
+  for (const x of parts) words.push({ w: x });
+  for (let i = 0; i < words.length; i++) words[i] = words[i].w;
+  const squashed = low.replace(/[^a-z]/g, "").replace(/(.)\1+/g, "$1");
+  return BLOCKED.some((w) => words.includes(w) || words.some((x) => x.replace(/(.)\1+/g, "$1") === w.replace(/(.)\1+/g, "$1")) ||
+    (w.length >= 5 && squashed.includes(w.replace(/(.)\1+/g, "$1"))));
 }
-const teamThread = (u) => soc.team.threads[u] || (soc.team.threads[u] = { last: 1, msgs: [] });   // id 1 is the welcome
-function teamView(u, viewer, teamSide) {
-  const t = soc.team.threads[u] || { last: 1, msgs: [] };
-  const all = [{ id: 1, t: 0, f: "team", m: WELCOME }, ...t.msgs];
-  return all.map((m) => ({
-    id: m.id, t: m.t, m: m.m,
-    n: m.f === "team" ? WELCOME_FROM : m.f === u ? nameOf(u) : nameOf(m.f),
-    mine: teamSide ? m.f !== u : m.f === viewer,
-  }));
+const WELCOME_MSG = { id: 1, t: 0, f: "team", to: null, m: WELCOME };
+// what a player sees: the welcome, team announcements, their own messages and team replies to them. The team sees everything.
+const seesTeamMsg = (m, me, team) => team || m.to === null || m.f === me || m.to === me;
+function teamFeed(me, team) { return [WELCOME_MSG, ...soc.team.feed].filter((m) => seesTeamMsg(m, me, team)); }
+function teamOut(m, me, team) {
+  let text = m.m;
+  if (team && m.to && m.to !== "team") text = "@" + nameOf(m.to) + " " + text;   // the team sees who a reply went to
+  return { id: m.id, t: m.t, m: text, n: m.f === "team" ? WELCOME_FROM : nameOf(m.f), mine: m.f === me };
 }
-function teamUnread(u, teamSide) {
-  const t = soc.team.threads[u] || { last: 1, msgs: [] };
-  const key = teamSide ? "team-staff|" + u : u + "|team";
-  const seen = soc.read[key] || 0;
-  return [{ id: 1, f: "team" }, ...t.msgs].filter((m) => m.id > seen && (teamSide ? m.f === u : m.f !== u)).length;
-}
-function markTeamRead(u, teamSide) {
-  const t = soc.team.threads[u] || { last: 1 };
-  const key = teamSide ? "team-staff|" + u : u + "|team";
-  if ((soc.read[key] || 0) < t.last) { soc.read[key] = t.last; socDirty = true; }
-}
+const teamUnread = (me, team) => { const seen = soc.read[me + "|team"] || 0; return teamFeed(me, team).filter((m) => m.id > seen && m.f !== me).length; };
+function markTeamRead(me) { if ((soc.read[me + "|team"] || 0) < soc.team.seq) { soc.read[me + "|team"] = soc.team.seq; socDirty = true; } }
+const TEAM_KEEP = 3000;
 
 async function socialRoute(req, url, send, s) {
   const p = url.pathname, me = s.u;
@@ -261,11 +273,8 @@ async function socialRoute(req, url, send, s) {
       const seen = soc.read[me + "|" + key] || 0;
       return t.msgs.filter((m) => m.id > seen && m.f !== me).length;
     };
-    const team = s.team ? Object.keys(soc.team.threads).filter((u) => u !== me && soc.team.threads[u].msgs.some((m) => m.f === u))
-      .map((u) => ({ u: dash(supportId(u)), n: "Help: " + nameOf(u), online: online(u), unread: teamUnread(u, true), faces: [dash(u)] }))
-      .sort((a, b) => b.unread - a.unread || a.n.localeCompare(b.n)) : [];
     return send({
-      friends: [{ u: dash(TEAM_ID), n: TEAM_CHAT_NAME, online: true, unread: teamUnread(me, false), faces: faces(), team: true }, ...team,
+      friends: [{ u: dash(TEAM_ID), n: TEAM_CHAT_NAME, online: true, unread: teamUnread(me, !!s.team), faces: faces(), team: true },
         ...friendsOf(me).map((f) => ({ u: dash(f), n: nameOf(f), online: online(f), unread: dmUnread(f) })).sort((a, b) => (b.online - a.online) || a.n.localeCompare(b.n))],
       incoming: soc.req.filter((r) => r.t === me).map((r) => ({ u: dash(r.f), n: nameOf(r.f) })),
       outgoing: soc.req.filter((r) => r.f === me).map((r) => ({ u: dash(r.t), n: nameOf(r.t) })),
@@ -275,11 +284,10 @@ async function socialRoute(req, url, send, s) {
   if (p === "/social/dm/get" && req.method === "GET") {
     const f = norm(url.searchParams.get("u"));
     const after = Number(url.searchParams.get("after")) || 0;
-    if (f === TEAM_ID || (s.team && soc.team.ids[f])) {
-      const who = f === TEAM_ID ? me : soc.team.ids[f], staff = f !== TEAM_ID;
-      const msgs = teamView(who, me, staff).filter((m) => m.id > after).slice(-100);
-      markTeamRead(who, staff);
-      return send({ messages: msgs, last: (soc.team.threads[who] || { last: 1 }).last });
+    if (f === TEAM_ID) {
+      const msgs = teamFeed(me, !!s.team).filter((m) => m.id > after).slice(-150).map((m) => teamOut(m, me, !!s.team));
+      markTeamRead(me);
+      return send({ messages: msgs, last: soc.team.seq });
     }
     if (!isId(f) || !areFriends(me, f)) return send({ error: "not friends" }, 403);
     const key = pairKey(me, f), t = soc.dms[key] || { last: 0, msgs: [] };
@@ -304,12 +312,22 @@ async function socialRoute(req, url, send, s) {
   }
   const other = norm(b.u);
   if (!isId(other)) return send({ error: "bad player" }, 400);
-  if (other === TEAM_ID || (s.team && soc.team.ids[other])) {
+  if (other === TEAM_ID) {
     if (p !== "/social/dm/send") return send({ error: "The SC Client chat can't be changed." }, 400);
-    const text = cleanText(b.text);
+    let text = cleanText(b.text);
     if (!text) return send({ error: "empty message" }, 400);
-    const staff = other !== TEAM_ID, who = staff ? soc.team.ids[other] : me;
-    if (!staff && !s.team) {
+    let to = "team";
+    if (s.team) {
+      to = null;   // the team: an announcement to everyone, or "@name ..." for one player
+      const at = /^@([A-Za-z0-9_]{1,16})\s+(.+)$/.exec(text);
+      if (at) {
+        const want = at[1].toLowerCase();
+        const u = Object.keys(soc.names).find((x) => soc.names[x].toLowerCase() === want);
+        if (!u) return send({ error: `No player called ${at[1]} has used the chat.` }, 404);
+        to = u; text = at[2];
+      }
+    } else {
+      if (blocked(text)) return send({ error: "That message has words that aren't allowed here. It wasn't sent, and you can still send one." }, 400);
       const wait = (soc.team.sent[me] || 0) + TEAM_GAP - Date.now();
       if (wait > 0) {
         const days = Math.ceil(wait / (24 * 3600 * 1000));
@@ -317,12 +335,11 @@ async function socialRoute(req, url, send, s) {
       }
     }
     if (!rateOk(s)) return send({ error: "too fast" }, 429);
-    const t = teamThread(who);
-    t.msgs.push({ id: ++t.last, t: Date.now(), f: me, m: text });
-    if (t.msgs.length > DM_KEEP) t.msgs.splice(0, t.msgs.length - DM_KEEP);
-    if (!staff && !s.team) soc.team.sent[me] = Date.now();
-    markTeamRead(who, staff);   // what you sent is read on your side
-    socDirty = true; return send({ ok: true, id: t.last });
+    const id = ++soc.team.seq;
+    soc.team.feed.push({ id, t: Date.now(), f: me, to, m: text });
+    if (soc.team.feed.length > TEAM_KEEP) soc.team.feed.splice(0, soc.team.feed.length - TEAM_KEEP);
+    if (!s.team) soc.team.sent[me] = Date.now();
+    socDirty = true; return send({ ok: true, id });
   }
   if (p === "/social/accept") {
     if (!soc.req.some((r) => r.f === other && r.t === me)) return send({ error: "No such request." }, 404);

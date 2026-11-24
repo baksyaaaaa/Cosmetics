@@ -36,6 +36,10 @@ One always-on service fits in Render's 750 free hours a month.
 
 ## The SC Client team chat
 Every player has an **SC Client** chat at the top of their friends list (id `5c000000-0000-0000-0000-000000000001`). It opens with a
-welcome from the team, and a player can send **one message there every 14 days**. Team members (`TEAM_NAMES`, default
-`baksya,wsammyyy` - Minecraft usernames) see every player who wrote as a "Help: <name>" chat and can answer without a limit.
-Friend entries can carry `faces` (player UUIDs to show as heads) and `team: true`.
+welcome from the team, and a player can send **one message there every 14 days** (messages go through a word filter; a blocked
+message doesn't use up the 14 days - add words with the `BLOCKED_WORDS` env var, comma separated).
+
+Players only see the welcome, their own messages, team announcements and team replies to them. Team members (`TEAM_NAMES`,
+default `baksya,wsammyyy` - Minecraft usernames) see every player's message in that same chat and have no limit:
+- `@steve open the Wardrobe tab` - only steve sees it
+- anything without `@name` - an announcement every player sees
