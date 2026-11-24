@@ -10,6 +10,55 @@ const num = (v, max) => Math.max(0, Math.min(max, Math.floor(Number(v) || 0)));
 let db = {};
 try { db = JSON.parse(fs.readFileSync(FILE, "utf8")); } catch {}
 let dirty = false;
+
+// ---------------- saved copy on GitHub ----------------
+// Free hosts (Render...) wipe their disk on every restart. With GITHUB_TOKEN and DATA_REPO set, everything is also saved
+// to that (private!) repo about once a minute and loaded from it on start, so nothing is lost.
+const GH_TOKEN = process.env.GITHUB_TOKEN || "", GH_REPO = process.env.DATA_REPO || "", GH_BRANCH = process.env.DATA_BRANCH || "main";
+const GH_ON = Boolean(GH_TOKEN && GH_REPO);
+const GH_API = (process.env.GITHUB_API || "https://api.github.com").replace(/\/$/, "");
+const SAVE_EVERY = Number(process.env.SAVE_EVERY_MS) || 60000;
+let ghReady = false;          // only save to GitHub after it was read successfully (never overwrite it with an empty start)
+const ghSha = {}, ghLast = {};
+function gh(path, opt = {}) {
+  return fetch(`${GH_API}/repos/${GH_REPO}/contents/${path}`, {
+    ...opt,
+    headers: { Authorization: `Bearer ${GH_TOKEN}`, "User-Agent": "chrome-client-cosmetics", Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28", ...(opt.headers || {}) },
+    signal: AbortSignal.timeout(30000),
+  });
+}
+async function ghLoad(name) {   // the parsed file, or null when it isn't there yet
+  const r = await gh(`${name}?ref=${encodeURIComponent(GH_BRANCH)}`);
+  if (r.status === 404) return null;
+  if (!r.ok) throw new Error(`GitHub said ${r.status} for ${name}`);
+  const j = await r.json();
+  ghSha[name] = j.sha;
+  let text;
+  if (j.encoding === "base64" && j.content) text = Buffer.from(j.content, "base64").toString("utf8");
+  else {   // files over 1 MB come without content: ask for the raw file
+    const raw = await gh(`${name}?ref=${encodeURIComponent(GH_BRANCH)}`, { headers: { Accept: "application/vnd.github.raw" } });
+    if (!raw.ok) throw new Error(`GitHub said ${raw.status} for ${name}`);
+    text = await raw.text();
+  }
+  ghLast[name] = text;
+  return JSON.parse(text);
+}
+async function ghSave(name, text) {
+  if (!GH_ON || !ghReady || ghLast[name] === text) return;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const body = { message: `save ${name}`, content: Buffer.from(text).toString("base64"), branch: GH_BRANCH };
+    if (ghSha[name]) body.sha = ghSha[name];
+    const r = await gh(name, { method: "PUT", body: JSON.stringify(body) });
+    if (r.ok) { ghSha[name] = (await r.json()).content.sha; ghLast[name] = text; return; }
+    if (r.status === 409 || r.status === 422) {   // the saved copy moved on: get its current version and try again
+      const m = await gh(`${name}?ref=${encodeURIComponent(GH_BRANCH)}`);
+      if (m.ok) ghSha[name] = (await m.json()).sha; else if (m.status === 404) delete ghSha[name];
+      continue;
+    }
+    throw new Error(`GitHub save of ${name} failed: ${r.status} ${await r.text().catch(() => "")}`.slice(0, 300));
+  }
+}
 setInterval(() => {
   const now = Date.now();
   for (const k of Object.keys(db)) if (now - db[k].t > TTL) { delete db[k]; dirty = true; }
@@ -109,6 +158,26 @@ try { const c = JSON.parse(fs.readFileSync(SOCIAL_FILE, "utf8")); if (c && c.nam
 let socDirty = false;
 const lastSeen = new Map();   // uuid -> ms of the last call, for the green dot
 setInterval(() => { if (socDirty) { try { fs.writeFileSync(SOCIAL_FILE, JSON.stringify(soc)); socDirty = false; } catch {} } }, 15000);
+const useSocial = (c) => { if (c && c.names) soc = { names: c.names, friends: c.friends || {}, req: c.req || [], dms: c.dms || {}, read: c.read || {} }; };
+
+// save to GitHub about once a minute, and once more when the host stops the server
+let saving = false;
+async function saveAll() {
+  if (saving) return;
+  saving = true;
+  try {
+    await ghSave("data.json", JSON.stringify(db));
+    await ghSave("social.json", JSON.stringify(soc));
+  } catch (e) { console.error(String(e.message || e)); }
+  finally { saving = false; }
+}
+setInterval(saveAll, SAVE_EVERY);
+for (const sig of ["SIGTERM", "SIGINT"]) process.on(sig, async () => {
+  try { fs.writeFileSync(FILE, JSON.stringify(db)); fs.writeFileSync(SOCIAL_FILE, JSON.stringify(soc)); } catch {}
+  saving = false;
+  await Promise.race([saveAll(), new Promise((r) => setTimeout(r, 8000))]);
+  process.exit(0);
+});
 
 const norm = (x) => String(x || "").replace(/-/g, "").toLowerCase();
 const isId = (x) => /^[0-9a-f]{32}$/.test(x);
@@ -197,7 +266,7 @@ async function socialRoute(req, url, send, s) {
   return send({ error: "not found" }, 404);
 }
 
-http.createServer((req, res) => {
+const server = http.createServer((req, res) => {
   const send = (o, s = 200) => { res.writeHead(s, { "Content-Type": "application/json", ...CORS }); res.end(JSON.stringify(o)); };
   if (req.method === "OPTIONS") { res.writeHead(204, CORS); return res.end(); }
   const url = new URL(req.url, "http://x");
@@ -221,5 +290,29 @@ http.createServer((req, res) => {
     for (const id of ids) if (db[id]) { const { t, ...d } = db[id]; out[id] = d; }
     return send(out);
   }
+  if (url.pathname === "/health") return send({ ok: true, saved: GH_ON ? (ghReady ? "github" : "github (not loaded yet)") : "disk only" });
   res.writeHead(200, CORS); res.end("Chrome Client cosmetics service");
-}).listen(PORT, () => console.log("listening on " + PORT));
+});
+
+// load the saved copy from GitHub first (a few tries), then start answering
+(async () => {
+  if (GH_ON) {
+    for (let attempt = 1; attempt <= 5 && !ghReady; attempt++) {
+      try {
+        const d = await ghLoad("data.json");
+        const c = await ghLoad("social.json");
+        if (d && typeof d === "object") db = d;
+        useSocial(c);
+        ghReady = true;
+        console.log(`loaded the saved copy from ${GH_REPO} (${Object.keys(db).length} players, ${Object.keys(soc.names).length} names)`);
+      } catch (e) {
+        console.error(`couldn't load from GitHub (try ${attempt}): ${e.message}`);
+        await new Promise((r) => setTimeout(r, 3000 * attempt));
+      }
+    }
+    if (!ghReady) console.error("starting WITHOUT the GitHub copy; it won't be overwritten until a restart loads it");
+  } else {
+    console.log("GITHUB_TOKEN / DATA_REPO not set: saving to this server's disk only (lost when a free host restarts)");
+  }
+  server.listen(PORT, () => console.log("listening on " + PORT));
+})();

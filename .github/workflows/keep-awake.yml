@@ -1,0 +1,36 @@
+name: Keep the cosmetics service awake
+
+# Render's free plan puts a service to sleep after 15 minutes without visits (the next visit then waits ~1 minute).
+# This visits it every 10 minutes so it never sleeps. GitHub runs scheduled workflows in public repos for free.
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write   # only for the keep-alive commit below
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Visit the service
+        run: |
+          for i in 1 2 3; do
+            if curl -fsS --max-time 90 https://cosmetics-md7h.onrender.com/health; then echo; exit 0; fi
+            sleep 20
+          done
+          echo "::warning::the service didn't answer (Render may be redeploying)"
+
+      # GitHub switches off scheduled workflows in a repo with no commits for 60 days: make a tiny one every 50 days
+      - uses: actions/checkout@v4
+      - name: Keep this schedule switched on
+        run: |
+          age=$(( $(date +%s) - $(git log -1 --format=%ct) ))
+          if [ "$age" -gt $((50 * 86400)) ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit --allow-empty -m "Keep the keep-awake schedule on [skip render]"
+            git push
+          fi
