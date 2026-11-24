@@ -127,11 +127,22 @@ async function chatRoute(req, url, send) {
     const exp = nonces.get(nonce);
     if (!name || !exp || exp < Date.now()) return send({ error: "bad or old nonce" }, 400);
     nonces.delete(nonce);   // one use only
-    let r;
-    try {
-      r = await fetch(`${MOJANG}/session/minecraft/hasJoined?username=${encodeURIComponent(name)}&serverId=${nonce}`, { signal: AbortSignal.timeout(8000) });
-    } catch { return send({ error: "could not reach Mojang" }, 502); }
-    if (r.status !== 200) return send({ error: "Mojang did not confirm this login" }, 401);
+    // Mojang sometimes needs a moment before it confirms a fresh login, so ask a few times before giving up
+    let r = null, last = 0;
+    for (const wait of [0, 700, 1500, 3000]) {
+      if (wait) await new Promise((ok) => setTimeout(ok, wait));
+      try {
+        r = await fetch(`${MOJANG}/session/minecraft/hasJoined?username=${encodeURIComponent(name)}&serverId=${nonce}`, { signal: AbortSignal.timeout(8000) });
+        last = r.status;
+        if (r.status === 200) break;
+      } catch { last = -1; }
+    }
+    if (!r || r.status !== 200) {
+      console.log(`login not confirmed for ${name}: Mojang answered ${last}`);
+      if (last === 429) return send({ error: "Mojang is busy right now. Try again in a minute." }, 503);
+      if (last === -1 || last >= 500) return send({ error: "Can't reach Mojang right now. Try again in a minute." }, 502);
+      return send({ error: "Mojang didn't confirm your login. Restart the game, or sign in again in the launcher." }, 401);
+    }
     let prof; try { prof = await r.json(); } catch { return send({ error: "bad answer from Mojang" }, 502); }
     const u = String(prof.id || "").toLowerCase();
     if (!/^[0-9a-f]{32}$/.test(u)) return send({ error: "bad answer from Mojang" }, 502);
