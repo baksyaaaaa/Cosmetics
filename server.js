@@ -1,4 +1,4 @@
-// Chrome Client cosmetics service: plain Node, no dependencies, works on any host (VPS, Render, Koyeb, Fly, Railway...).
+// SC Client cosmetics + chat service: plain Node, no dependencies, works on any host (VPS, Render, Koyeb, Fly, Railway...).
 const http = require("http"), fs = require("fs"), crypto = require("crypto");
 const FILE = process.env.DATA_FILE || "data.json";
 const PORT = process.env.PORT || 8080;
@@ -69,6 +69,15 @@ setInterval(() => {
 // Players prove who they are with Mojang's own login check (the same one Minecraft servers use), so nobody can type as
 // somebody else: /chat/nonce -> the game calls joinServer with it -> /chat/login. (There is no public room: only friends can talk.)
 const MOJANG = (process.env.MOJANG_URL || "https://sessionserver.mojang.com").replace(/\/$/, "");
+const MOJANG_API = (process.env.MOJANG_API_URL || "https://api.mojang.com").replace(/\/$/, "");
+/** a Minecraft username -> { u: uuid without dashes, n: name as Mojang spells it }, or null when there is no such player */
+async function lookUpPlayer(name) {
+  const r = await fetch(`${MOJANG_API}/users/profiles/minecraft/${encodeURIComponent(name)}`, { signal: AbortSignal.timeout(8000) });
+  if (r.status === 404 || r.status === 204) return null;
+  if (!r.ok) throw new Error("mojang " + r.status);
+  const j = await r.json();
+  return /^[0-9a-f]{32}$/i.test(j.id || "") ? { u: j.id.toLowerCase(), n: cleanName(j.name) || name } : null;
+}
 const BANNED = new Set((process.env.CHAT_BANNED || "").toLowerCase().split(",").map((s) => s.trim()).filter(Boolean));   // uuids, no dashes
 const MAX_LEN = 200;         // characters in a message
 const MIN_GAP = 1200;        // ms between two messages from one player
@@ -183,7 +192,7 @@ const teamFaces = new Map();   // lower-case name -> uuid (no dashes), looked up
 async function lookUpTeamFaces() {
   for (const name of TEAM_NAMES) {
     try {
-      const r = await fetch(`https://api.mojang.com/users/profiles/minecraft/${encodeURIComponent(name)}`, { signal: AbortSignal.timeout(8000) });
+      const r = await fetch(`${MOJANG_API}/users/profiles/minecraft/${encodeURIComponent(name)}`, { signal: AbortSignal.timeout(8000) });
       if (r.ok) { const j = await r.json(); if (/^[0-9a-f]{32}$/i.test(j.id || "")) teamFaces.set(name.toLowerCase(), j.id.toLowerCase()); }
     } catch {}
   }
@@ -309,8 +318,15 @@ async function socialRoute(req, url, send, s) {
   let b; try { b = await readJson(req); } catch (e) { return send({ error: e.message }, 400); }
   if (p === "/social/request") {
     const want = cleanName(b.name).toLowerCase();
-    const t = Object.keys(soc.names).find((u) => soc.names[u].toLowerCase() === want);
-    if (!want || !t) return send({ error: "That player has not used Chrome Client chat yet." }, 404);
+    if (!want) return send({ error: "Type a Minecraft username." }, 400);
+    let t = Object.keys(soc.names).find((u) => soc.names[u].toLowerCase() === want);
+    if (!t) {   // never used SC Client yet: find them through Mojang, they'll see the request when they first open friends
+      let found;
+      try { found = await lookUpPlayer(want); } catch { return send({ error: "Couldn't look that player up right now. Try again in a minute." }, 502); }
+      if (!found) return send({ error: "There's no Minecraft player with that name." }, 404);
+      t = found.u;
+      if (!soc.names[t]) { soc.names[t] = found.n; socDirty = true; }
+    }
     if (t === me) return send({ error: "That is you." }, 400);
     if (BANNED.has(t)) return send({ error: "That player cannot be added." }, 403);
     if (areFriends(me, t)) return send({ error: "Already friends." }, 400);
@@ -403,7 +419,7 @@ const server = http.createServer((req, res) => {
     return send(out);
   }
   if (url.pathname === "/health") return send({ ok: true, saved: GH_ON ? (ghReady ? "github" : "github (not loaded yet)") : "disk only" });
-  res.writeHead(200, CORS); res.end("Chrome Client cosmetics service");
+  res.writeHead(200, CORS); res.end("SC Client service");
 });
 
 // load the saved copy from GitHub first (a few tries), then start answering
