@@ -127,13 +127,22 @@ async function chatRoute(req, url, send) {
   // what Mojang answers this server (no player data): sessionserver should say 204 for a login that never happened
   if (p === "/chat/diag" && req.method === "GET") {
     const out = { lastLogins: loginLog.slice(-10) };
-    for (const [k, u] of [["hasJoined", `${MOJANG}/session/minecraft/hasJoined?username=Notch&serverId=${crypto.randomBytes(8).toString("hex")}`],
-                          ["profile", `${MOJANG_API}/users/profiles/minecraft/Notch`]]) {
+    const BROWSER = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36";
+    const sid = crypto.randomBytes(8).toString("hex");
+    for (const [k, u, ua] of [["hasJoined", `${MOJANG}/session/minecraft/hasJoined?username=Notch&serverId=${sid}`, "SCClient-service"],
+                          ["hasJoinedBrowserUA", `${MOJANG}/session/minecraft/hasJoined?username=Notch&serverId=${sid}`, BROWSER],
+                          ["hasJoinedJavaUA", `${MOJANG}/session/minecraft/hasJoined?username=Notch&serverId=${sid}`, "Java/21.0.5"],
+                          ["sessionProfile", `${MOJANG}/session/minecraft/profile/069a79f444e94726a5befca90e38aaf5`, "SCClient-service"],
+                          ["profile", `${MOJANG_API}/users/profiles/minecraft/Notch`, "SCClient-service"],
+                          ["servicesProfile", `https://api.minecraftservices.com/minecraft/profile/lookup/name/Notch`, "SCClient-service"],
+                          ["publickeys", `https://api.minecraftservices.com/publickeys`, "SCClient-service"]]) {
       try {
-        const r = await fetch(u, { signal: AbortSignal.timeout(8000), headers: { "User-Agent": "SCClient-service" } });
-        out[k] = { status: r.status, server: r.headers.get("server"), body: (await r.text()).slice(0, 160) };
+        const r = await fetch(u, { signal: AbortSignal.timeout(8000), headers: { "User-Agent": ua } });
+        const body = await r.text();
+        out[k] = { status: r.status, body: body.replace(/\s+/g, " ").slice(0, k === "publickeys" ? 60 : 300) };
       } catch (e) { out[k] = { error: String(e && e.cause ? e.cause.code || e.cause : e) }; }
     }
+    try { const ip = await fetch("https://api.ipify.org", { signal: AbortSignal.timeout(5000) }); out.myIp = await ip.text(); } catch {}
     return send(out);
   }
   if (p === "/chat/nonce" && req.method === "POST") {
