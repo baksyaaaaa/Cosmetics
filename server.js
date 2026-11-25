@@ -125,7 +125,7 @@ function sessionOf(req) {
 async function chatRoute(req, url, send) {
   const p = url.pathname;
   // what Mojang answers this server (no player data): sessionserver should say 204 for a login that never happened
-  if (p === "/diag/mojang" && req.method === "GET") {
+  if (p === "/chat/diag" && req.method === "GET") {
     const out = { lastLogins: loginLog.slice(-10) };
     for (const [k, u] of [["hasJoined", `${MOJANG}/session/minecraft/hasJoined?username=Notch&serverId=${crypto.randomBytes(8).toString("hex")}`],
                           ["profile", `${MOJANG_API}/users/profiles/minecraft/Notch`]]) {
