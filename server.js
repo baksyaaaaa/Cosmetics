@@ -1,5 +1,5 @@
 // SC Client cosmetics + chat service: plain Node, no dependencies, works on any host (VPS, Render, Koyeb, Fly, Railway...).
-const http = require("http"), fs = require("fs"), crypto = require("crypto");
+const http = require("http"), fs = require("fs"), crypto = require("crypto"), path = require("path");
 const FILE = process.env.DATA_FILE || "data.json";
 const PORT = process.env.PORT || 8080;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -122,6 +122,53 @@ function sessionOf(req) {
   return s && s.exp > Date.now() ? s : null;
 }
 
+function startSession(send, u, n) {
+  const token = crypto.randomBytes(24).toString("hex");
+  const sess = { u, n, exp: Date.now() + SESSION_TTL, lastAt: 0, times: [] };
+  sess.team = teamUuids().includes(u);
+  sessions.set(token, sess);
+  if (soc.names[u] !== n) { soc.names[u] = n; socDirty = true; }
+  return send({ token, uuid: dash(u), name: n, expiresIn: SESSION_TTL / 1000 });
+}
+
+// ---------------- sign-in with the Mojang player certificate ----------------
+// Mojang gives every signed-in player a key pair and signs (uuid, expiry, public key) with its own key - the same certificate
+// Minecraft uses to sign chat. The player signs our nonce with their private key. Both checks happen here, so nothing
+// depends on reaching Mojang (Render's address is blocked by Mojang). mojang-keys.json and team.json are kept up to date
+// by a GitHub Action (.github/workflows/mojang-keys.yml).
+const readJsonFile = (f, fallback) => { try { return JSON.parse(fs.readFileSync(path.join(__dirname, f), "utf8")); } catch { return fallback; } };
+const MOJANG_KEYS = (readJsonFile("mojang-keys.json", {}).playerCertificateKeys || []).map((k) => {
+  try { return crypto.createPublicKey({ key: Buffer.from(k, "base64"), format: "der", type: "spki" }); } catch { return null; }
+}).filter(Boolean);
+const TEAM_FILE = readJsonFile("team.json", {});
+const teamUuids = () => Object.values(TEAM_FILE).map((x) => String(x).toLowerCase().replace(/-/g, ""));
+
+/** "2026-11-26T03:12:45.123456Z" -> epoch milliseconds, cut to whole milliseconds the way Java's Instant.toEpochMilli does */
+function isoToMillis(iso) {
+  const m = /^(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)(?:\.(\d+))?Z$/.exec(String(iso || ""));
+  if (!m) return NaN;
+  const ms = Number(((m[7] || "") + "000").slice(0, 3));
+  return Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]) + ms;
+}
+
+/** returns the player's uuid (no dashes) when the certificate is Mojang's and the nonce was signed with its key, else null */
+function checkCertificate(cert, nonce, sig) {
+  try {
+    const u = String(cert.uuid || "").toLowerCase().replace(/-/g, "");
+    if (!/^[0-9a-f]{32}$/.test(u)) return null;
+    const expires = typeof cert.expiresAtMs === "number" ? cert.expiresAtMs : isoToMillis(cert.expiresAt);
+    if (!Number.isFinite(expires) || expires < Date.now()) return null;
+    const der = Buffer.from(String(cert.publicKey || ""), "base64");
+    const playerKey = crypto.createPublicKey({ key: der, format: "der", type: "spki" });
+    const when = Buffer.alloc(8); when.writeBigInt64BE(BigInt(expires));
+    const signed = Buffer.concat([Buffer.from(u, "hex"), when, der]);
+    const mojangSig = Buffer.from(String(cert.keySig || ""), "base64");
+    if (!MOJANG_KEYS.some((k) => crypto.verify("sha1", signed, k, mojangSig))) return null;
+    if (!crypto.verify("sha256", Buffer.from(nonce, "utf8"), playerKey, Buffer.from(String(sig || ""), "base64"))) return null;
+    return u;
+  } catch { return null; }
+}
+
 async function chatRoute(req, url, send) {
   const p = url.pathname;
   // what Mojang answers this server (no player data): sessionserver should say 204 for a login that never happened
@@ -158,6 +205,14 @@ async function chatRoute(req, url, send) {
     const exp = nonces.get(nonce);
     if (!name || !exp || exp < Date.now()) return send({ error: "bad or old nonce" }, 400);
     nonces.delete(nonce);   // one use only
+    if (b.cert) {   // sign-in with the player certificate: checked here, without asking Mojang
+      const u = checkCertificate(b.cert, nonce, b.sig);
+      if (!u) return send({ error: "Your sign-in couldn't be checked. Sign in again in the launcher, then try again." }, 401);
+      if (BANNED.has(u) || BANNED.has(dash(u))) return send({ error: "you are not allowed to chat" }, 403);
+      // a team member's name only belongs to the team member's account
+      if (TEAM_NAMES.some((n) => n.toLowerCase() === name.toLowerCase()) && !teamUuids().includes(u)) return send({ error: "That name isn't yours." }, 403);
+      return startSession(send, u, name);
+    }
     // Mojang sometimes needs a moment before it confirms a fresh login, so ask a few times before giving up
     let r = null, last = 0, lastBody = "";
     for (const wait of [0, 700, 1500, 3000]) {
@@ -181,12 +236,7 @@ async function chatRoute(req, url, send) {
     const u = String(prof.id || "").toLowerCase();
     if (!/^[0-9a-f]{32}$/.test(u)) return send({ error: "bad answer from Mojang" }, 502);
     if (BANNED.has(u) || BANNED.has(dash(u))) return send({ error: "you are not allowed to chat" }, 403);
-    const token = crypto.randomBytes(24).toString("hex");
-    const sess = { u, n: cleanName(prof.name) || name, exp: Date.now() + SESSION_TTL, lastAt: 0, times: [] };
-    sess.team = isTeam(sess);
-    sessions.set(token, sess);
-    if (soc.names[u] !== (cleanName(prof.name) || name)) { soc.names[u] = cleanName(prof.name) || name; socDirty = true; }
-    return send({ token, uuid: dash(u), name: cleanName(prof.name) || name, expiresIn: SESSION_TTL / 1000 });
+    return startSession(send, u, cleanName(prof.name) || name);
   }
   const s = sessionOf(req);
   if (!s) return send({ error: "sign in first" }, 401);
@@ -213,18 +263,8 @@ const TEAM_GAP = 14 * 24 * 3600 * 1000;
 const WELCOME_FROM = "baksya & wsammyyy";
 const WELCOME = "We're baksya and wsammyyy, the creators of SC Client. If you have any questions, feel free to ask them in this chat. " +
   "Be careful what you send, because you can only send one message here every 14 days.";
-const teamFaces = new Map();   // lower-case name -> uuid (no dashes), looked up from Mojang
-async function lookUpTeamFaces() {
-  for (const name of TEAM_NAMES) {
-    try {
-      const r = await fetch(`${MOJANG_API}/users/profiles/minecraft/${encodeURIComponent(name)}`, { signal: AbortSignal.timeout(8000) });
-      if (r.ok) { const j = await r.json(); if (/^[0-9a-f]{32}$/i.test(j.id || "")) teamFaces.set(name.toLowerCase(), j.id.toLowerCase()); }
-    } catch {}
-  }
-}
-lookUpTeamFaces(); setInterval(lookUpTeamFaces, 6 * 3600 * 1000);
-const isTeam = (s) => TEAM_NAMES.some((n) => n.toLowerCase() === String(s.n || "").toLowerCase()) || [...teamFaces.values()].includes(s.u);
-const faces = () => TEAM_NAMES.map((n) => teamFaces.get(n.toLowerCase())).filter(Boolean).map(dash);
+const isTeam = (s) => teamUuids().includes(s.u);
+const faces = () => teamUuids().map(dash);
 let soc = { names: {}, friends: {}, req: [], dms: {}, read: {}, team: { feed: [], seq: 1, sent: {} } };   // names: uuid -> name, friends: uuid -> [uuid], req: [{f,t}], dms: pair -> {last,msgs}, read: "uuid|pair" -> id, team: the SC Client chat
 function teamOf(c) {
   const t = c.team || {};
@@ -345,6 +385,8 @@ async function socialRoute(req, url, send, s) {
     const want = cleanName(b.name).toLowerCase();
     if (!want) return send({ error: "Type a Minecraft username." }, 400);
     let t = Object.keys(soc.names).find((u) => soc.names[u].toLowerCase() === want);
+    const given = norm(b.u);   // the game / launcher looked the name up with Mojang itself (this server can't reach Mojang)
+    if (!t && isId(given)) { t = given; if (!soc.names[t]) { soc.names[t] = cleanName(b.name); socDirty = true; } }
     if (!t) {   // never used SC Client yet: find them through Mojang, they'll see the request when they first open friends
       let found;
       try { found = await lookUpPlayer(want); } catch { return send({ error: "Couldn't look that player up right now. Try again in a minute." }, 502); }
