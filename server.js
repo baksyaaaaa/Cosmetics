@@ -68,6 +68,7 @@ setInterval(() => {
 // ---------------- chat ----------------
 // Players prove who they are with Mojang's own login check (the same one Minecraft servers use), so nobody can type as
 // somebody else: /chat/nonce -> the game calls joinServer with it -> /chat/login. (There is no public room: only friends can talk.)
+const loginLog = [];   // the last failed logins: only time, Mojang's status and its reply, for /diag/mojang
 const MOJANG = (process.env.MOJANG_URL || "https://sessionserver.mojang.com").replace(/\/$/, "");
 const MOJANG_API = (process.env.MOJANG_API_URL || "https://api.mojang.com").replace(/\/$/, "");
 /** a Minecraft username -> { u: uuid without dashes, n: name as Mojang spells it }, or null when there is no such player */
@@ -123,6 +124,18 @@ function sessionOf(req) {
 
 async function chatRoute(req, url, send) {
   const p = url.pathname;
+  // what Mojang answers this server (no player data): sessionserver should say 204 for a login that never happened
+  if (p === "/diag/mojang" && req.method === "GET") {
+    const out = { lastLogins: loginLog.slice(-10) };
+    for (const [k, u] of [["hasJoined", `${MOJANG}/session/minecraft/hasJoined?username=Notch&serverId=${crypto.randomBytes(8).toString("hex")}`],
+                          ["profile", `${MOJANG_API}/users/profiles/minecraft/Notch`]]) {
+      try {
+        const r = await fetch(u, { signal: AbortSignal.timeout(8000), headers: { "User-Agent": "SCClient-service" } });
+        out[k] = { status: r.status, server: r.headers.get("server"), body: (await r.text()).slice(0, 160) };
+      } catch (e) { out[k] = { error: String(e && e.cause ? e.cause.code || e.cause : e) }; }
+    }
+    return send(out);
+  }
   if (p === "/chat/nonce" && req.method === "POST") {
     if (tooManyFromIp(req, 30)) return send({ error: "slow down" }, 429);
     const nonce = crypto.randomBytes(16).toString("hex");
@@ -137,17 +150,20 @@ async function chatRoute(req, url, send) {
     if (!name || !exp || exp < Date.now()) return send({ error: "bad or old nonce" }, 400);
     nonces.delete(nonce);   // one use only
     // Mojang sometimes needs a moment before it confirms a fresh login, so ask a few times before giving up
-    let r = null, last = 0;
+    let r = null, last = 0, lastBody = "";
     for (const wait of [0, 700, 1500, 3000]) {
       if (wait) await new Promise((ok) => setTimeout(ok, wait));
       try {
         r = await fetch(`${MOJANG}/session/minecraft/hasJoined?username=${encodeURIComponent(name)}&serverId=${nonce}`, { signal: AbortSignal.timeout(8000) });
         last = r.status;
         if (r.status === 200) break;
+        lastBody = (await r.text().catch(() => "")).slice(0, 160);
       } catch { last = -1; }
     }
     if (!r || r.status !== 200) {
       console.log(`login not confirmed for ${name}: Mojang answered ${last}`);
+      loginLog.push({ at: new Date().toISOString(), status: last, body: lastBody });
+      if (loginLog.length > 50) loginLog.shift();
       if (last === 429) return send({ error: "Mojang is busy right now. Try again in a minute." }, 503);
       if (last === -1 || last >= 500) return send({ error: "Can't reach Mojang right now. Try again in a minute." }, 502);
       return send({ error: "Mojang didn't confirm your login. Restart the game, or sign in again in the launcher." }, 401);
